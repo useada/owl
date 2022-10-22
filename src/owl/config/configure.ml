@@ -117,7 +117,7 @@ let get_devmode_cflags _c =
 
 
 let default_gcc_path =
-  let p0 = "/usr/local/lib/gcc/7" in
+  let p0 = "/usr/local/lib/gcc/current" in
   if Sys.file_exists p0 then [ "-L" ^ p0 ] else []
 
 

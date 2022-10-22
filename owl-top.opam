@@ -1,4 +1,5 @@
 opam-version: "2.0"
+version: "1.0.2"
 maintainer: "Liang Wang <ryanrhymes@gmail.com>"
 authors: [ "Liang Wang" ]
 license: "MIT"
