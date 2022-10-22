@@ -5,6 +5,45 @@
 
 module C = Configurator.V1
 
+let detect_system_os =
+  {|
+  #if __APPLE__
+    #include <TargetConditionals.h>
+    #if TARGET_OS_IPHONE
+      #define PLATFORM_NAME "ios"
+    #else
+      #define PLATFORM_NAME "mac"
+    #endif
+  #elif __linux__
+    #if __ANDROID__
+      #define PLATFORM_NAME "android"
+    #else
+      #define PLATFORM_NAME "linux"
+    #endif
+  #elif WIN32
+    #define PLATFORM_NAME "windows"
+  #else
+    #define PLATFORM_NAME "unknown"
+  #endif
+|}
+
+
+let detect_system_arch =
+  {|
+  #if __x86_64__
+    #define PLATFORM_ARCH "x86_64"
+  #elif __i386__
+    #define PLATFORM_ARCH "x86"
+  #elif __aarch64__
+    #define PLATFORM_ARCH "arm64"
+  #elif __arm__
+    #define PLATFORM_ARCH "arm"
+  #else
+    #define PLATFORM_ARCH "unknown"
+  #endif
+|}
+
+
 let bgetenv v =
   let v' =
     try Sys.getenv v |> int_of_string with
@@ -76,44 +115,59 @@ let get_ocaml_devmode_flags _c =
   if not enable_devmode then [] else [ "-w"; "-32-27-6-37-3" ]
 
 
-let default_cflags =
-  try
-    Sys.getenv "OWL_CFLAGS"
-    |> String.trim
-    |> String.split_on_char ' '
-    |> List.filter (fun s -> String.trim s <> "")
-  with
-  | Not_found ->
-    [ (* Basic optimisation *)
-      "-g"
-    ; "-O3"
-    ; "-Ofast"
-    ; (* FIXME: experimental switches *)
-      (* "-mavx2"; "-mfma"; "-ffp-contract=fast"; *)
-      (* Experimental switches, -ffast-math may break IEEE754 semantics*)
-      "-march=native"
-    ; "-mfpmath=sse"
-    ; "-funroll-loops"
-    ; "-ffast-math"
-    ; (* Configure Mersenne Twister RNG *)
-      "-DSFMT_MEXP=19937"
-    ; "-msse2"
-    ; "-fno-strict-aliasing"
-    ]
-
+let default_config c =
+  let os =
+    let platform = C.C_define.import c ~includes:[ ] ~prelude:detect_system_os [ "PLATFORM_NAME", String ] in
+    match List.map snd platform with
+    | [ String "android" ] -> `android
+    | [ String "ios" ]     -> `ios
+    | [ String "linux" ]   -> `linux
+    | [ String "mac" ]     -> `mac
+    | [ String "windows" ] -> `windows
+    | _                    -> `unknown
+  in
+  let arch =
+    let arch = C.C_define.import c ~includes:[ ] ~prelude:detect_system_arch [ "PLATFORM_ARCH", String ] in
+    match List.map snd arch with
+    | [ String "x86_64" ] -> `x86_64
+    | [ String "x86" ]    -> `x86
+    | [ String "arm64" ]  -> `arm64
+    | [ String "arm" ]    -> `arm
+    | _                   -> `unknown
+  in
+  let cflags =
+    try
+      Sys.getenv "OWL_CFLAGS"
+      |> String.trim
+      |> String.split_on_char ' '
+      |> List.filter (fun s -> String.trim s <> "")
+    with
+    | Not_found ->
+      [ (* Basic optimisation *) "-g"; "-O3"; "-Ofast" ]
+      @ (match arch, os with
+        | `arm64, `mac -> [ "-mcpu=apple-m1" ]
+        | `x86_64, _   -> [ "-march=native"; "-mfpmath=sse"; "-msse2" ]
+        | _            -> [])
+      @ [ (* Experimental switches, -ffast-math may break IEEE754 semantics*)
+          "-funroll-loops"
+        ; "-ffast-math"
+        ; (* Configure Mersenne Twister RNG *)
+          "-DSFMT_MEXP=19937"
+        ; "-fno-strict-aliasing"
+        ]
+  in
+  (* homebrew M1 issue workaround, works only if users use the default homebrew path *)
+  let libs =
+    let p0 = "/opt/homebrew/opt/gcc/lib/gcc/current/" in
+    if os = `mac && arch = `arm64 && Sys.file_exists p0 then [ "-L" ^ p0 ] else []
+  in
+  C.Pkg_config.{ cflags; libs }
 
 let default_libs = [ "-lm" ]
 
 let get_expmode_cflags _c =
   let enable_expmode = bgetenv "OWL_ENABLE_EXPMODE" in
   if not enable_expmode then [] else [ "-flto" ]
-
-
-let get_devmode_cflags _c =
-  let enable_devmode = bgetenv "OWL_ENABLE_DEVMODE" in
-  if not enable_devmode
-  then [ "-Wno-logical-op-parentheses" ]
-  else [ "-Wall"; "-pedantic"; "-Wextra"; "-Wunused" ]
 
 
 let default_gcc_path =
@@ -184,11 +238,12 @@ the output of `src/owl/config/configure.exe --verbose`.
 
 let () =
   C.main ~name:"owl" (fun c ->
+      let default_config = default_config c in
+      let default_pkg_config = { C.Pkg_config.cflags = []; libs = [] } in
       let cblas_conf =
-        let default = { C.Pkg_config.cflags = []; libs = [] } in
         let open Base.Option.Monad_infix in
         Base.Option.value
-          ~default
+          ~default:default_pkg_config
           (C.Pkg_config.get c >>= C.Pkg_config.query ~package:"cblas")
       in
       let openblas_conf =
@@ -202,7 +257,7 @@ let () =
               c
               test_linking
               ~c_flags:openblas_conf.cflags
-              ~link_flags:openblas_conf.libs
+              ~link_flags:(default_config.libs @ openblas_conf.libs)
       then (
         Printf.printf
           {|
@@ -221,7 +276,7 @@ some details on how your openblas has been installed and the output of
           Base.(Sexp.to_string @@ sexp_of_list sexp_of_string openblas_conf.cflags)
           Base.(Sexp.to_string @@ sexp_of_list sexp_of_string openblas_conf.libs);
         failwith "Unable to link against openblas.");
-      let lapacke_lib =
+      let lapacke_conf =
         let disable_linking_flag = bgetenv "OWL_DISABLE_LAPACKE_LINKING_FLAG" in
         let needs_lapacke_flag =
           if disable_linking_flag
@@ -231,16 +286,23 @@ some details on how your openblas has been installed and the output of
               c
               test_lapacke_working_code
               ~c_flags:openblas_conf.cflags
-              ~link_flags:(openblas_conf.libs @ [ "-lm" ])
+              ~link_flags:(default_config.libs @ openblas_conf.libs @ [ "-lm" ])
             |> not
         in
-        if needs_lapacke_flag then [ "-llapacke" ] else []
+        if needs_lapacke_flag
+        then
+          let open Base.Option.Monad_infix in
+          Base.Option.value
+            ~default:C.Pkg_config.{ cflags = []; libs = [ "-llapacke" ] }
+            (C.Pkg_config.get c >>= C.Pkg_config.query ~package:"llapacke")
+        else default_pkg_config
       in
       let openmp_config = get_openmp_config c in
       (* configure link options *)
       let libs =
         []
-        @ lapacke_lib
+        @ default_config.libs
+        @ lapacke_conf.libs
         @ openblas_conf.libs
         @ cblas_conf.libs
         @ default_libs
@@ -250,11 +312,11 @@ some details on how your openblas has been installed and the output of
       in
       (* configure compile options *)
       let cflags =
-        []
+        [ "-Wall"; "-pedantic"; "-Wextra"; "-Wunused" ]
+        @ lapacke_conf.cflags
         @ openblas_conf.cflags
         @ cblas_conf.cflags
-        @ default_cflags
-        @ get_devmode_cflags c
+        @ default_config.cflags
         @ get_expmode_cflags c
         @ openmp_config.cflags
       in
